@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>System Design — Order Processing Microservices</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: #0f1117;
+      color: #e2e8f0;
+      min-height: 100vh;
+      padding: 40px 24px;
+    }
+
+    h1 {
+      text-align: center;
+      font-size: 1.75rem;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+      color: #f8fafc;
+      margin-bottom: 6px;
+    }
+
+    .subtitle {
+      text-align: center;
+      font-size: 0.85rem;
+      color: #64748b;
+      margin-bottom: 48px;
+    }
+
+    /* ── LAYERS ── */
+    .diagram {
+      max-width: 1100px;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+    }
+
+    .layer {
+      position: relative;
+      border: 1px solid #1e293b;
+      border-radius: 16px;
+      padding: 28px 32px 32px;
+      margin-bottom: 0;
+    }
+
+    .layer + .layer { margin-top: 16px; }
+
+    .layer-label {
+      position: absolute;
+      top: -12px;
+      left: 24px;
+      font-size: 0.7rem;
+      font-weight: 700;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      padding: 2px 10px;
+      border-radius: 99px;
+    }
+
+    .layer-client  { background: #0f1723; border-color: #1e3a5f; }
+    .layer-client .layer-label  { background: #1e3a5f; color: #60a5fa; }
+
+    .layer-services { background: #0d1a14; border-color: #14532d; }
+    .layer-services .layer-label { background: #14532d; color: #4ade80; }
+
+    .layer-infra   { background: #1a0f0f; border-color: #7f1d1d; }
+    .layer-infra .layer-label   { background: #7f1d1d; color: #f87171; }
+
+    .layer-tests   { background: #130f1a; border-color: #4c1d95; }
+    .layer-tests .layer-label   { background: #4c1d95; color: #c084fc; }
+
+    /* ── ROW ── */
+    .row {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0;
+      flex-wrap: wrap;
+    }
+
+    /* ── BOXES ── */
+    .box {
+      border-radius: 12px;
+      padding: 18px 22px;
+      min-width: 160px;
+      text-align: center;
+      position: relative;
+      border: 1px solid transparent;
+      transition: transform 0.18s, box-shadow 0.18s;
+      cursor: default;
+    }
+
+    .box:hover {
+      transform: translateY(-3px);
+      box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    }
+
+    .box-icon { font-size: 1.8rem; margin-bottom: 8px; display: block; }
+    .box-title { font-size: 0.82rem; font-weight: 700; margin-bottom: 4px; color: #f1f5f9; }
+    .box-desc  { font-size: 0.68rem; color: #94a3b8; line-height: 1.5; }
+    .box-tag   {
+      display: inline-block;
+      margin-top: 8px;
+      font-size: 0.6rem;
+      font-weight: 700;
+      letter-spacing: 0.8px;
+      padding: 2px 7px;
+      border-radius: 99px;
+      text-transform: uppercase;
+    }
+
+    /* colour variants */
+    .blue  { background: #0c1f3a; border-color: #2563eb; }
+    .blue .box-tag  { background: #1d4ed8; color: #bfdbfe; }
+
+    .green { background: #052e16; border-color: #16a34a; }
+    .green .box-tag { background: #15803d; color: #bbf7d0; }
+
+    .orange { background: #1c0f00; border-color: #ea580c; }
+    .orange .box-tag { background: #c2410c; color: #fed7aa; }
+
+    .red   { background: #1f0707; border-color: #dc2626; }
+    .red .box-tag   { background: #b91c1c; color: #fecaca; }
+
+    .purple { background: #160b2e; border-color: #7c3aed; }
+    .purple .box-tag { background: #6d28d9; color: #ddd6fe; }
+
+    .gray  { background: #0f172a; border-color: #475569; }
+    .gray .box-tag  { background: #334155; color: #cbd5e1; }
+
+    /* ── ARROWS ── */
+    .arrow {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 0 12px;
+      gap: 4px;
+      flex-shrink: 0;
+    }
+
+    .arrow-line {
+      width: 56px;
+      height: 2px;
+      background: linear-gradient(90deg, #334155, #64748b);
+      position: relative;
+    }
+
+    .arrow-line::after {
+      content: '';
+      position: absolute;
+      right: -1px;
+      top: -5px;
+      border-left: 8px solid #64748b;
+      border-top: 6px solid transparent;
+      border-bottom: 6px solid transparent;
+    }
+
+    .arrow-label {
+      font-size: 0.58rem;
+      color: #475569;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .arrow-label-top { order: -1; }
+
+    /* vertical arrow (between layers) */
+    .v-arrow {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      margin: 4px 0;
+    }
+
+    .v-arrow-line {
+      width: 2px;
+      height: 36px;
+      background: linear-gradient(180deg, #334155, #64748b);
+      position: relative;
+    }
+
+    .v-arrow-line::after {
+      content: '';
+      position: absolute;
+      bottom: -1px;
+      left: -5px;
+      border-top: 8px solid #64748b;
+      border-left: 6px solid transparent;
+      border-right: 6px solid transparent;
+    }
+
+    .v-arrow-label {
+      font-size: 0.6rem;
+      color: #475569;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+    }
+
+    /* ── TESTS ROW ── */
+    .tests-row {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+
+    .test-card {
+      background: #1a1030;
+      border: 1px solid #4c1d95;
+      border-radius: 10px;
+      padding: 14px 18px;
+      min-width: 190px;
+      flex: 1;
+    }
+
+    .test-card-title {
+      font-size: 0.75rem;
+      font-weight: 700;
+      color: #c084fc;
+      margin-bottom: 8px;
+    }
+
+    .test-item {
+      font-size: 0.65rem;
+      color: #94a3b8;
+      padding: 3px 0;
+      padding-left: 12px;
+      position: relative;
+    }
+
+    .test-item::before {
+      content: '✓';
+      position: absolute;
+      left: 0;
+      color: #a855f7;
+    }
+
+    /* ── LEGEND ── */
+    .legend {
+      display: flex;
+      gap: 20px;
+      justify-content: center;
+      flex-wrap: wrap;
+      margin-top: 36px;
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      font-size: 0.68rem;
+      color: #64748b;
+    }
+
+    .legend-dot {
+      width: 10px; height: 10px;
+      border-radius: 3px;
+      flex-shrink: 0;
+    }
+
+    /* ── DOCKER BADGE ── */
+    .docker-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      background: #0e1929;
+      border: 1px solid #1e40af;
+      border-radius: 6px;
+      padding: 3px 8px;
+      font-size: 0.6rem;
+      color: #93c5fd;
+      font-weight: 600;
+      margin-top: 6px;
+    }
+
+    /* ── FLOW SECTION ── */
+    .flow-section {
+      max-width: 1100px;
+      margin: 32px auto 0;
+      background: #0d1117;
+      border: 1px solid #1e293b;
+      border-radius: 16px;
+      padding: 24px 32px;
+    }
+
+    .flow-title {
+      font-size: 0.75rem;
+      font-weight: 700;
+      color: #475569;
+      text-transform: uppercase;
+      letter-spacing: 1.2px;
+      margin-bottom: 16px;
+    }
+
+    .flow-steps {
+      display: flex;
+      align-items: center;
+      gap: 0;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+
+    .flow-step {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+    }
+
+    .step-num {
+      width: 28px; height: 28px;
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 0.7rem;
+      font-weight: 800;
+      margin-bottom: 6px;
+    }
+
+    .step-text {
+      font-size: 0.65rem;
+      color: #94a3b8;
+      max-width: 100px;
+      line-height: 1.4;
+    }
+
+    .flow-arrow {
+      width: 40px;
+      height: 2px;
+      background: #1e293b;
+      position: relative;
+      margin-bottom: 20px;
+      flex-shrink: 0;
+    }
+
+    .flow-arrow::after {
+      content: '';
+      position: absolute;
+      right: -1px; top: -5px;
+      border-left: 7px solid #334155;
+      border-top: 5px solid transparent;
+      border-bottom: 5px solid transparent;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>Order Processing — Microservices Architecture</h1>
+  <p class="subtitle">FastAPI · Kafka · Docker · pytest</p>
+
+  <div class="diagram">
+
+    <!-- CLIENT LAYER -->
+    <div class="layer layer-client">
+      <span class="layer-label">Client</span>
+      <div class="row">
+        <div class="box blue">
+          <span class="box-icon">🖥️</span>
+          <div class="box-title">HTTP Client</div>
+          <div class="box-desc">curl / Postman<br/>Any REST consumer</div>
+          <span class="box-tag">External</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- v-arrow -->
+    <div class="v-arrow">
+      <div class="v-arrow-line"></div>
+      <span class="v-arrow-label">HTTP POST /orders · GET /health</span>
+      <div class="v-arrow-line"></div>
+    </div>
+
+    <!-- SERVICES LAYER -->
+    <div class="layer layer-services">
+      <span class="layer-label">Microservices</span>
+      <div class="row">
+
+        <!-- Order Service -->
+        <div class="box green">
+          <span class="box-icon">📦</span>
+          <div class="box-title">Order Service</div>
+          <div class="box-desc">
+            <strong>POST /orders</strong> — validates &amp; publishes<br/>
+            <strong>GET /health</strong> — liveness probe<br/>
+            Port <strong>8000</strong>
+          </div>
+          <span class="box-tag">FastAPI + Uvicorn</span>
+          <br/>
+          <span class="docker-badge">🐳 Dockerfile</span>
+        </div>
+
+        <!-- Arrow: Order → Kafka -->
+        <div class="arrow">
+          <span class="arrow-label arrow-label-top">Produce</span>
+          <div class="arrow-line"></div>
+          <span class="arrow-label">topic: orders</span>
+        </div>
+
+        <!-- Kafka -->
+        <div class="box orange">
+          <span class="box-icon">⚡</span>
+          <div class="box-title">Apache Kafka</div>
+          <div class="box-desc">
+            Topic: <strong>orders</strong><br/>
+            Port <strong>9092</strong><br/>
+            Auto-create enabled
+          </div>
+          <span class="box-tag">Bitnami 3.5</span>
+          <br/>
+          <span class="docker-badge">🐳 Docker image</span>
+        </div>
+
+        <!-- Arrow: Kafka → Notification -->
+        <div class="arrow">
+          <span class="arrow-label arrow-label-top">Consume</span>
+          <div class="arrow-line"></div>
+          <span class="arrow-label">group: notif</span>
+        </div>
+
+        <!-- Notification Service -->
+        <div class="box red">
+          <span class="box-icon">🔔</span>
+          <div class="box-title">Notification Service</div>
+          <div class="box-desc">
+            Consumes order events<br/>
+            Logs structured notifications<br/>
+            Infinite consumer loop
+          </div>
+          <span class="box-tag">kafka-python</span>
+          <br/>
+          <span class="docker-badge">🐳 Dockerfile</span>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- v-arrow -->
+    <div class="v-arrow">
+      <div class="v-arrow-line"></div>
+      <span class="v-arrow-label">Managed by docker-compose</span>
+      <div class="v-arrow-line"></div>
+    </div>
+
+    <!-- INFRASTRUCTURE LAYER -->
+    <div class="layer layer-infra">
+      <span class="layer-label">Infrastructure — docker-compose.yml</span>
+      <div class="row">
+
+        <div class="box gray">
+          <span class="box-icon">🦓</span>
+          <div class="box-title">Zookeeper</div>
+          <div class="box-desc">
+            Kafka cluster coordination<br/>
+            Port <strong>2181</strong>
+          </div>
+          <span class="box-tag">Bitnami 3.8</span>
+        </div>
+
+        <div class="arrow">
+          <div class="arrow-line"></div>
+          <span class="arrow-label">depends_on</span>
+        </div>
+
+        <div class="box orange">
+          <span class="box-icon">⚡</span>
+          <div class="box-title">Kafka Broker</div>
+          <div class="box-desc">
+            PLAINTEXT listener<br/>
+            Port <strong>9092</strong>
+          </div>
+          <span class="box-tag">Bitnami 3.5</span>
+        </div>
+
+        <div class="arrow">
+          <div class="arrow-line"></div>
+          <span class="arrow-label">depends_on</span>
+        </div>
+
+        <div class="box green">
+          <span class="box-icon">📦</span>
+          <div class="box-title">Order Service</div>
+          <div class="box-desc">
+            Built from<br/>
+            <code style="font-size:0.65rem;color:#86efac">./services/order_service</code>
+          </div>
+          <span class="box-tag">:8000</span>
+        </div>
+
+        <div class="arrow">
+          <div class="arrow-line" style="background:linear-gradient(90deg,#334155,#334155);"></div>
+          <span class="arrow-label">&amp;</span>
+        </div>
+
+        <div class="box red">
+          <span class="box-icon">🔔</span>
+          <div class="box-title">Notification Service</div>
+          <div class="box-desc">
+            Built from<br/>
+            <code style="font-size:0.65rem;color:#fca5a5">./services/notification_service</code>
+          </div>
+          <span class="box-tag">no exposed port</span>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- v-arrow -->
+    <div class="v-arrow">
+      <div class="v-arrow-line"></div>
+      <span class="v-arrow-label">Covered by unit tests</span>
+      <div class="v-arrow-line"></div>
+    </div>
+
+    <!-- TESTS LAYER -->
+    <div class="layer layer-tests">
+      <span class="layer-label">Test Suite — pytest · unittest.mock</span>
+      <div class="tests-row">
+
+        <div class="test-card">
+          <div class="test-card-title">📋 test_api.py — Order Service API</div>
+          <div class="test-item">POST /orders returns 201</div>
+          <div class="test-item">Invalid payload returns 422</div>
+          <div class="test-item">GET /health returns 200</div>
+        </div>
+
+        <div class="test-card">
+          <div class="test-card-title">📤 test_producer.py — Kafka Producer</div>
+          <div class="test-item">send_order() calls KafkaProducer.send()</div>
+          <div class="test-item">send_order() calls flush()</div>
+          <div class="test-item">close() calls KafkaProducer.close()</div>
+        </div>
+
+        <div class="test-card">
+          <div class="test-card-title">📥 test_consumer.py — Kafka Consumer</div>
+          <div class="test-item">consume() logs order_id &amp; product</div>
+          <div class="test-item">close() calls KafkaConsumer.close()</div>
+        </div>
+
+      </div>
+    </div>
+
+  </div>
+
+  <!-- REQUEST FLOW -->
+  <div class="flow-section">
+    <div class="flow-title">Request Flow</div>
+    <div class="flow-steps">
+
+      <div class="flow-step">
+        <div class="step-num" style="background:#1e3a5f;color:#60a5fa;">1</div>
+        <div class="step-text">Client sends<br/><strong>POST /orders</strong></div>
+      </div>
+      <div class="flow-arrow"></div>
+
+      <div class="flow-step">
+        <div class="step-num" style="background:#14532d;color:#4ade80;">2</div>
+        <div class="step-text">FastAPI validates<br/>Pydantic model</div>
+      </div>
+      <div class="flow-arrow"></div>
+
+      <div class="flow-step">
+        <div class="step-num" style="background:#14532d;color:#4ade80;">3</div>
+        <div class="step-text">OrderProducer<br/>publishes to Kafka</div>
+      </div>
+      <div class="flow-arrow"></div>
+
+      <div class="flow-step">
+        <div class="step-num" style="background:#7f1d1d;color:#f87171;">4</div>
+        <div class="step-text">Kafka stores<br/>message in topic</div>
+      </div>
+      <div class="flow-arrow"></div>
+
+      <div class="flow-step">
+        <div class="step-num" style="background:#7f1d1d;color:#f87171;">5</div>
+        <div class="step-text">OrderConsumer<br/>receives event</div>
+      </div>
+      <div class="flow-arrow"></div>
+
+      <div class="flow-step">
+        <div class="step-num" style="background:#4c1d95;color:#c084fc;">6</div>
+        <div class="step-text">Notification<br/>logged to stdout</div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- LEGEND -->
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#2563eb;"></div> Client</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#16a34a;"></div> Order Service (FastAPI)</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#ea580c;"></div> Kafka / Zookeeper</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#dc2626;"></div> Notification Service</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#7c3aed;"></div> pytest Test Suite</div>
+  </div>
+
+</body>
+</html>
