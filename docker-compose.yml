@@ -38,3 +38,19 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+
+  inventory_service:
+    build: ./services/inventory_service
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  payment_service:
+    build: ./services/payment_service
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
