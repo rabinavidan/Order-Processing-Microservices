@@ -1,10 +1,11 @@
 import os
 from contextlib import asynccontextmanager
+from typing import Optional
 from fastapi import FastAPI
 from models import Order
 from producer import OrderProducer
 
-producer: OrderProducer | None = None
+producer: Optional[OrderProducer] = None
 
 
 @asynccontextmanager
