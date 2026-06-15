@@ -12,17 +12,43 @@ A mini microservices project demonstrating **FastAPI**, **Apache Kafka**, **Dock
       │ POST /orders
       ▼
 [Order Service]  ──── Kafka topic: orders ────▶  [Notification Service]
-  FastAPI :8000                                      kafka-python consumer
-      │
-      ▼
-  GET /health
+  FastAPI :8000                           │           kafka-python consumer
+      │                                   │
+      ▼                                   ▼
+  GET /health                    [Inventory Service]
+                                  checks & reserves stock
+                                           │
+                                           │ Kafka topic: inventory.reserved
+                                           ▼
+                                  [Payment Service]
+                                  processes payment
+                                           │
+                                           │ Kafka topic: payments.processed
 ```
 
-| Service              | Role                                          | Tech              |
-|----------------------|-----------------------------------------------|-------------------|
-| Order Service        | REST API — validates and publishes orders     | FastAPI, Uvicorn  |
-| Notification Service | Consumes order events, logs notifications     | kafka-python      |
-| Kafka (KRaft)        | Message broker, topic `orders`               | Confluent 7.6.1   |
+| Service              | Role                                                      | Tech             |
+|----------------------|-----------------------------------------------------------|------------------|
+| Order Service        | REST API — validates and publishes orders                 | FastAPI, Uvicorn |
+| Notification Service | Consumes `orders`, logs notifications                     | kafka-python     |
+| Inventory Service    | Consumes `orders`, reserves stock, publishes result       | kafka-python     |
+| Payment Service      | Consumes `inventory.reserved`, processes payment          | kafka-python     |
+| Kafka (KRaft)        | Message broker                                            | Confluent 7.6.1  |
+
+### Kafka Topics
+
+| Topic                  | Producer          | Consumer(s)                          |
+|------------------------|-------------------|--------------------------------------|
+| `orders`               | Order Service     | Notification Service, Inventory Service |
+| `inventory.reserved`   | Inventory Service | Payment Service                      |
+| `payments.processed`   | Payment Service   | —                                    |
+
+### In-memory stock (Inventory Service)
+
+| Product    | Initial stock |
+|------------|---------------|
+| `laptop`   | 10            |
+| `phone`    | 5             |
+| `keyboard` | 20            |
 
 ---
 
@@ -42,14 +68,31 @@ A mini microservices project demonstrating **FastAPI**, **Apache Kafka**, **Dock
 │   │   └── tests/
 │   │       ├── test_api.py         # Endpoint tests (TestClient)
 │   │       └── test_producer.py    # Producer unit tests
-│   └── notification_service/
+│   ├── notification_service/
+│   │   ├── main.py                 # Consumer entry point
+│   │   ├── consumer.py             # KafkaConsumer wrapper
+│   │   ├── requirements.txt
+│   │   ├── Dockerfile
+│   │   └── tests/
+│   │       └── test_consumer.py    # Consumer unit tests
+│   ├── inventory_service/
+│   │   ├── main.py                 # Consumer entry point
+│   │   ├── consumer.py             # Consumes orders, reserves stock
+│   │   ├── producer.py             # Publishes to inventory.reserved
+│   │   ├── requirements.txt
+│   │   ├── Dockerfile
+│   │   └── tests/
+│   │       ├── test_consumer.py    # Stock reservation logic tests
+│   │       └── test_producer.py    # Producer unit tests
+│   └── payment_service/
 │       ├── main.py                 # Consumer entry point
-│       ├── consumer.py             # KafkaConsumer wrapper
+│       ├── consumer.py             # Consumes inventory.reserved, processes payment
+│       ├── producer.py             # Publishes to payments.processed
 │       ├── requirements.txt
 │       ├── Dockerfile
 │       └── tests/
-│           └── test_consumer.py    # Consumer unit tests
-└── examples/                       # Python learning examples
+│           ├── test_consumer.py    # Payment processing logic tests
+│           └── test_producer.py    # Producer unit tests
 ```
 
 ---
@@ -71,6 +114,8 @@ Services started:
 - Kafka broker on `localhost:9092`
 - Order Service API on `http://localhost:8000`
 - Notification Service (background consumer)
+- Inventory Service (background consumer)
+- Payment Service (background consumer)
 
 ### Send a test order
 
@@ -85,7 +130,10 @@ Expected response:
 {"message": "Order received", "order_id": "1"}
 ```
 
-Check notification service logs in the docker-compose output — it will print the consumed event.
+Watch the docker-compose logs — you will see:
+1. **Notification Service** logs the incoming order
+2. **Inventory Service** logs the stock reservation
+3. **Payment Service** logs the payment result
 
 ### Health check
 
@@ -108,7 +156,7 @@ Tests use mocked Kafka — no Docker required.
 **Order Service**
 ```bash
 cd services/order_service
-pip install -r requirements.txt httpx
+pip install -r requirements.txt
 pytest
 ```
 
@@ -119,13 +167,31 @@ pip install -r requirements.txt
 pytest
 ```
 
+**Inventory Service**
+```bash
+cd services/inventory_service
+pip install -r requirements.txt
+pytest
+```
+
+**Payment Service**
+```bash
+cd services/payment_service
+pip install -r requirements.txt
+pytest
+```
+
 ### Test coverage
 
-| File                  | Tests                                              |
-|-----------------------|----------------------------------------------------|
-| `test_api.py`         | POST /orders → 201, invalid payload → 422, GET /health → 200 |
-| `test_producer.py`    | `send_order()` calls Kafka send + flush, `close()` calls Kafka close |
-| `test_consumer.py`    | `consume()` logs order data, `close()` calls Kafka close |
+| File                                        | Tests                                                                 |
+|---------------------------------------------|-----------------------------------------------------------------------|
+| `order_service/test_api.py`                 | POST /orders → 201, invalid payload → 422, GET /health → 200         |
+| `order_service/test_producer.py`            | `send_order()` calls Kafka send + flush, `close()` calls Kafka close |
+| `notification_service/test_consumer.py`     | `consume()` logs order data, `close()` calls Kafka close             |
+| `inventory_service/test_consumer.py`        | reserved/insufficient/boundary/unknown product/field preservation    |
+| `inventory_service/test_producer.py`        | `send()` calls Kafka send + flush, `close()` calls Kafka close       |
+| `payment_service/test_consumer.py`          | paid when reserved, skips when insufficient/missing, field preservation |
+| `payment_service/test_producer.py`          | `send()` calls Kafka send + flush, `close()` calls Kafka close       |
 
 ---
 
@@ -163,9 +229,9 @@ Create a new order and publish it to Kafka.
 
 ## Environment Variables
 
-| Variable                 | Default          | Description                  |
-|--------------------------|------------------|------------------------------|
-| `KAFKA_BOOTSTRAP_SERVERS`| `localhost:9092` | Kafka broker address         |
+| Variable                 | Default          | Description          |
+|--------------------------|------------------|----------------------|
+| `KAFKA_BOOTSTRAP_SERVERS`| `localhost:9092` | Kafka broker address |
 
 ---
 
