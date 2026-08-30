@@ -61,6 +61,14 @@ A mini microservices project demonstrating **FastAPI**, **Apache Kafka**, **Dock
 .
 ├── docker-compose.yml
 ├── architecture.html               # Visual system design diagram
+├── contracts/                      # Kafka topic JSON Schemas (producer/consumer contract)
+│   ├── orders.schema.json
+│   ├── inventory_reserved.schema.json
+│   └── payments_processed.schema.json
+├── e2e/                             # Cross-service end-to-end test (real Kafka via testcontainers)
+│   ├── conftest.py
+│   ├── test_order_pipeline.py
+│   └── requirements.txt
 ├── services/
 │   ├── order_service/
 │   │   ├── main.py                 # FastAPI app (POST /orders, GET /health)
@@ -70,14 +78,16 @@ A mini microservices project demonstrating **FastAPI**, **Apache Kafka**, **Dock
 │   │   ├── Dockerfile
 │   │   └── tests/
 │   │       ├── test_api.py         # Endpoint tests (TestClient)
-│   │       └── test_producer.py    # Producer unit tests
+│   │       ├── test_producer.py    # Producer unit tests
+│   │       └── test_contract.py    # `orders` topic contract tests
 │   ├── notification_service/
 │   │   ├── main.py                 # Consumer entry point
 │   │   ├── consumer.py             # KafkaConsumer wrapper
 │   │   ├── requirements.txt
 │   │   ├── Dockerfile
 │   │   └── tests/
-│   │       └── test_consumer.py    # Consumer unit tests
+│   │       ├── test_consumer.py    # Consumer unit tests
+│   │       └── test_contract.py    # `orders` topic contract tests
 │   ├── inventory_service/
 │   │   ├── main.py                 # Consumer entry point
 │   │   ├── consumer.py             # Consumes orders, reserves stock
@@ -86,7 +96,8 @@ A mini microservices project demonstrating **FastAPI**, **Apache Kafka**, **Dock
 │   │   ├── Dockerfile
 │   │   └── tests/
 │   │       ├── test_consumer.py    # Stock reservation logic tests
-│   │       └── test_producer.py    # Producer unit tests
+│   │       ├── test_producer.py    # Producer unit tests
+│   │       └── test_contract.py    # `orders` / `inventory.reserved` contract tests
 │   └── payment_service/
 │       ├── main.py                 # Consumer entry point
 │       ├── consumer.py             # Consumes inventory.reserved, processes payment
@@ -95,7 +106,8 @@ A mini microservices project demonstrating **FastAPI**, **Apache Kafka**, **Dock
 │       ├── Dockerfile
 │       └── tests/
 │           ├── test_consumer.py    # Payment processing logic tests
-│           └── test_producer.py    # Producer unit tests
+│           ├── test_producer.py    # Producer unit tests
+│           └── test_contract.py    # `inventory.reserved` / `payments.processed` contract tests
 ```
 
 ---
@@ -152,17 +164,31 @@ docker-compose down
 
 ---
 
+## Testing Strategy
+
+Tests are layered like a pyramid:
+
+| Layer        | Where                                    | What it proves                                                                 | Speed / deps            |
+|--------------|-------------------------------------------|---------------------------------------------------------------------------------|--------------------------|
+| **Unit**     | `services/*/tests/test_{producer,consumer,api}.py` | Each service's business logic in isolation, Kafka fully mocked                  | Milliseconds, no Docker |
+| **Contract** | `services/*/tests/test_contract.py`       | Every producer's output — and every consumer's input handling — matches the shared JSON Schema for its topic in [`contracts/`](contracts) | Milliseconds, no Docker |
+| **End-to-end** | [`e2e/test_order_pipeline.py`](e2e/test_order_pipeline.py) | The full saga over a **real** Kafka broker (testcontainers): `orders` → `inventory.reserved` → `payments.processed`, plus the independent `notification_service` delivery | ~30s, needs Docker      |
+
+The contract tests exist specifically to catch the failure mode unit tests miss: a producer and a downstream consumer silently drifting apart (e.g. a renamed field) while each service's own mocked tests keep passing. See [`contracts/README.md`](contracts/README.md) for details.
+
 ## Continuous Integration
 
 Every push and pull request runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml), which:
 
-- Runs `pytest` for each of the 4 services in a matrix job (Python 3.11)
+- Runs `pytest` (unit + contract tests) for each of the 4 services in a matrix job (Python 3.11)
+- Enforces a **70% coverage gate** per service (`--cov-fail-under=70`) — a service with a test suite too thin to reach 70% fails the build
 - Collects coverage with `pytest-cov` and uploads an HTML/XML coverage report as a CI artifact per service
 - Publishes coverage to Codecov (aggregated across all 4 services)
+- Runs the [end-to-end pipeline test](e2e/test_order_pipeline.py) in its own job, spinning up a real Kafka broker via testcontainers
 
 ## Running Tests Locally
 
-Tests use mocked Kafka — no Docker required. Add `--cov=. --cov-report=term-missing` to any `pytest` command below to see coverage locally.
+Unit and contract tests use mocked Kafka — no Docker required. Add `--cov=. --cov-report=term-missing` to any `pytest` command below to see coverage locally.
 
 **Order Service**
 ```bash
@@ -192,17 +218,29 @@ pip install -r requirements.txt
 pytest
 ```
 
+**End-to-end pipeline test** (needs Docker running locally)
+```bash
+cd e2e
+pip install -r requirements.txt
+pytest -v
+```
+
 ### Test coverage
 
 | File                                        | Tests                                                                 |
 |---------------------------------------------|-----------------------------------------------------------------------|
-| `order_service/test_api.py`                 | POST /orders → 201, invalid payload → 422, GET /health → 200         |
+| `order_service/test_api.py`                 | POST /orders → 201, invalid payload → 422, wrong type → 422, missing field → 422, GET /health → 200, GET /orders → 405, response body, producer called with payload |
 | `order_service/test_producer.py`            | `send_order()` calls Kafka send + flush, `close()` calls Kafka close |
-| `notification_service/test_consumer.py`     | `consume()` logs order data, `close()` calls Kafka close             |
+| `order_service/test_contract.py`            | producer output validates against `orders` schema; schema rejects missing/wrong-typed fields |
+| `notification_service/test_consumer.py`     | logs order fields, handles missing fields, multiple messages, consumer topic/group config, `close()` |
+| `notification_service/test_contract.py`     | consumer accepts any `orders`-schema-valid message                    |
 | `inventory_service/test_consumer.py`        | reserved/insufficient/boundary/unknown product/field preservation    |
 | `inventory_service/test_producer.py`        | `send()` calls Kafka send + flush, `close()` calls Kafka close       |
+| `inventory_service/test_contract.py`        | consumer accepts `orders`-schema messages; producer output validates against `inventory.reserved` schema |
 | `payment_service/test_consumer.py`          | paid when reserved, skips when insufficient/missing, field preservation |
 | `payment_service/test_producer.py`          | `send()` calls Kafka send + flush, `close()` calls Kafka close       |
+| `payment_service/test_contract.py`          | consumer accepts `inventory.reserved`-schema messages; producer output validates against `payments.processed` schema |
+| `e2e/test_order_pipeline.py`                | full order saga over a real Kafka broker, across all 4 services' actual code |
 
 ---
 

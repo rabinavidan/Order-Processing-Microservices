@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://order-processing-microservices/contracts/inventory_reserved.schema.json",
+  "title": "inventory.reserved",
+  "description": "Message published by inventory_service to the 'inventory.reserved' topic, consumed by payment_service. Carries all 'orders' fields plus the inventory decision.",
+  "type": "object",
+  "required": ["order_id", "product", "quantity", "inventory_status"],
+  "properties": {
+    "order_id": { "type": "string" },
+    "product": { "type": "string" },
+    "quantity": { "type": "integer" },
+    "inventory_status": { "type": "string", "enum": ["reserved", "insufficient"] }
+  },
+  "additionalProperties": false
+}

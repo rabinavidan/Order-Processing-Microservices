@@ -1,0 +1,16 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://order-processing-microservices/contracts/payments_processed.schema.json",
+  "title": "payments.processed",
+  "description": "Message published by payment_service to the 'payments.processed' topic. Carries all 'inventory.reserved' fields plus the payment decision. Only emitted for reserved orders.",
+  "type": "object",
+  "required": ["order_id", "product", "quantity", "inventory_status", "payment_status"],
+  "properties": {
+    "order_id": { "type": "string" },
+    "product": { "type": "string" },
+    "quantity": { "type": "integer" },
+    "inventory_status": { "type": "string", "enum": ["reserved"] },
+    "payment_status": { "type": "string", "enum": ["paid"] }
+  },
+  "additionalProperties": false
+}
