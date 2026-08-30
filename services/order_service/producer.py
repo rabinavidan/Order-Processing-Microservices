@@ -11,7 +11,7 @@ class OrderProducer:
             value_serializer=lambda v: json.dumps(v).encode("utf-8"),
         )
 
-    def send_order(self, order: dict) -> None:
+    def send(self, order: dict) -> None:
         self._producer.send(TOPIC, order)
         self._producer.flush()
 

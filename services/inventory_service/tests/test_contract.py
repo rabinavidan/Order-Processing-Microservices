@@ -4,11 +4,17 @@ from unittest.mock import MagicMock, patch
 
 import jsonschema
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
+
 from consumer import InventoryConsumer
+from db import Base, OutboxEvent, Stock, make_session_factory
 from dlq_producer import DLQProducer
 from producer import InventoryProducer
 
 CONTRACTS_DIR = Path(__file__).resolve().parents[3] / "contracts"
+
+_DEFAULT_STOCK = {"laptop": 10, "phone": 5, "keyboard": 20}
 
 
 def load_schema(name: str) -> dict:
@@ -21,10 +27,19 @@ DLQ_ENVELOPE_SCHEMA = load_schema("dlq_envelope.schema.json")
 
 
 def make_consumer():
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    session_factory = make_session_factory(engine)
+    with session_factory() as session:
+        for product, quantity in _DEFAULT_STOCK.items():
+            session.add(Stock(product=product, quantity=quantity))
+        session.commit()
+
     with patch("consumer.KafkaConsumer"):
-        producer = MagicMock()
         dlq_producer = MagicMock()
-        return InventoryConsumer("localhost:9092", producer=producer, dlq_producer=dlq_producer), producer
+        return InventoryConsumer(
+            "localhost:9092", dlq_producer=dlq_producer, session_factory=session_factory
+        ), session_factory
 
 
 @pytest.mark.parametrize(
@@ -38,10 +53,11 @@ def make_consumer():
 def test_consumer_accepts_any_orders_contract_valid_message(order):
     jsonschema.validate(instance=order, schema=ORDERS_SCHEMA)
 
-    c, producer = make_consumer()
+    c, session_factory = make_consumer()
     c._process(order)
 
-    published = producer.send.call_args[0][0]
+    with session_factory() as session:
+        published = session.query(OutboxEvent).order_by(OutboxEvent.id.desc()).first().payload
     jsonschema.validate(instance=published, schema=INVENTORY_RESERVED_SCHEMA)
 
 

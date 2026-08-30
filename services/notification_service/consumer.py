@@ -3,6 +3,9 @@ import logging
 import time
 
 from kafka import KafkaConsumer
+from sqlalchemy.exc import IntegrityError
+
+from db import ProcessedMessage
 
 logger = logging.getLogger(__name__)
 
@@ -17,14 +20,15 @@ class OrderConsumer:
         self,
         bootstrap_servers: str,
         dlq_producer,
+        session_factory,
         topic: str = IN_TOPIC,
         max_retries: int = DEFAULT_MAX_RETRIES,
         retry_backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS,
     ):
         self._dlq_producer = dlq_producer
+        self._session_factory = session_factory
         self._max_retries = max_retries
         self._retry_backoff_seconds = retry_backoff_seconds
-        self._seen_order_ids: set = set()
         self._running = True
         self._consumer = KafkaConsumer(
             topic,
@@ -35,7 +39,8 @@ class OrderConsumer:
             # fully handled (processed or routed to the DLQ) — see consume().
             # This gives correct at-least-once delivery: a crash between
             # receiving and committing redelivers the message on restart,
-            # which idempotent processing (dedup by order_id) makes safe.
+            # which idempotent processing (dedup by order_id, persisted in
+            # ProcessedMessage) makes safe even across a service restart.
             enable_auto_commit=False,
         )
 
@@ -58,6 +63,24 @@ class OrderConsumer:
     def stop(self) -> None:
         self._running = False
 
+    def _is_duplicate(self, order_id) -> bool:
+        if order_id is None:
+            return False
+        with self._session_factory() as session:
+            return session.get(ProcessedMessage, order_id) is not None
+
+    def _mark_processed(self, order_id) -> None:
+        if order_id is None:
+            return
+        with self._session_factory() as session:
+            session.add(ProcessedMessage(order_id=order_id))
+            try:
+                session.commit()
+            except IntegrityError:
+                # Already marked (e.g. a race with a redelivery) — fine, the
+                # goal (durably recorded) already holds.
+                session.rollback()
+
     def _handle_message(self, raw_value: bytes) -> None:
         try:
             order = json.loads(raw_value.decode("utf-8"))
@@ -67,15 +90,14 @@ class OrderConsumer:
             return
 
         order_id = order.get("order_id")
-        if order_id is not None and order_id in self._seen_order_ids:
+        if self._is_duplicate(order_id):
             logger.info("Duplicate order_id=%s already processed, skipping (idempotent)", order_id)
             return
 
         for attempt in range(1, self._max_retries + 1):
             try:
                 self._process(order)
-                if order_id is not None:
-                    self._seen_order_ids.add(order_id)
+                self._mark_processed(order_id)
                 return
             except Exception as exc:
                 logger.warning(

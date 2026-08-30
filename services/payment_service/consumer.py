@@ -4,9 +4,12 @@ import time
 
 from kafka import KafkaConsumer
 
+from db import OutboxEvent, Payment
+
 logger = logging.getLogger(__name__)
 
 IN_TOPIC = "inventory.reserved"
+OUT_TOPIC = "payments.processed"
 GROUP_ID = "payment-group"
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_BACKOFF_SECONDS = 0.5
@@ -16,17 +19,16 @@ class PaymentConsumer:
     def __init__(
         self,
         bootstrap_servers: str,
-        producer,
         dlq_producer,
+        session_factory,
         topic: str = IN_TOPIC,
         max_retries: int = DEFAULT_MAX_RETRIES,
         retry_backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS,
     ):
-        self._producer = producer
         self._dlq_producer = dlq_producer
+        self._session_factory = session_factory
         self._max_retries = max_retries
         self._retry_backoff_seconds = retry_backoff_seconds
-        self._seen_order_ids: set = set()
         self._running = True
         self._consumer = KafkaConsumer(
             topic,
@@ -37,7 +39,8 @@ class PaymentConsumer:
             # fully handled (processed or routed to the DLQ) — see consume().
             # This gives correct at-least-once delivery: a crash between
             # receiving and committing redelivers the message on restart,
-            # which idempotent processing (dedup by order_id) makes safe.
+            # which idempotent processing (dedup via the Payment table, see
+            # _is_duplicate) makes safe even across a service restart.
             enable_auto_commit=False,
         )
 
@@ -60,6 +63,12 @@ class PaymentConsumer:
     def stop(self) -> None:
         self._running = False
 
+    def _is_duplicate(self, order_id) -> bool:
+        if order_id is None:
+            return False
+        with self._session_factory() as session:
+            return session.get(Payment, order_id) is not None
+
     def _handle_message(self, raw_value: bytes) -> None:
         try:
             event = json.loads(raw_value.decode("utf-8"))
@@ -69,15 +78,13 @@ class PaymentConsumer:
             return
 
         order_id = event.get("order_id")
-        if order_id is not None and order_id in self._seen_order_ids:
+        if self._is_duplicate(order_id):
             logger.info("Duplicate order_id=%s already processed, skipping (idempotent)", order_id)
             return
 
         for attempt in range(1, self._max_retries + 1):
             try:
                 self._process(event)
-                if order_id is not None:
-                    self._seen_order_ids.add(order_id)
                 return
             except Exception as exc:
                 logger.warning(
@@ -91,16 +98,35 @@ class PaymentConsumer:
                     self._dlq_producer.send(raw_value, error=str(exc))
 
     def _process(self, event: dict) -> None:
-        if event.get("inventory_status") != "reserved":
-            logger.info("Payment skipped: order_id=%s reason=inventory_%s",
-                        event.get("order_id"), event.get("inventory_status", "unknown"))
-            return
+        """Record the payment outcome — atomically, in one DB transaction:
+        the Payment row (business record + idempotency ledger) and, when a
+        payment is actually made, the outbox event that will publish to
+        `payments.processed`, commit together or not at all (the Outbox
+        pattern)."""
+        order_id = event.get("order_id")
+        product = event.get("product")
+        quantity = event.get("quantity")
+        inventory_status = event.get("inventory_status") or "unknown"
 
-        logger.info("Payment processed: order_id=%s product=%s qty=%s status=paid",
-                    event.get("order_id"), event.get("product"), event.get("quantity"))
-        self._producer.send({**event, "payment_status": "paid"})
+        with self._session_factory() as session:
+            if inventory_status != "reserved":
+                logger.info("Payment skipped: order_id=%s reason=inventory_%s", order_id, inventory_status)
+                session.add(Payment(
+                    order_id=order_id, product=product, quantity=quantity,
+                    inventory_status=inventory_status, payment_status=None,
+                ))
+                session.commit()
+                return
+
+            logger.info("Payment processed: order_id=%s product=%s qty=%s status=paid", order_id, product, quantity)
+            payment_event = {**event, "payment_status": "paid"}
+            session.add(OutboxEvent(topic=OUT_TOPIC, payload=payment_event))
+            session.add(Payment(
+                order_id=order_id, product=product, quantity=quantity,
+                inventory_status=inventory_status, payment_status="paid",
+            ))
+            session.commit()
 
     def close(self) -> None:
         self._consumer.close()
-        self._producer.close()
         self._dlq_producer.close()

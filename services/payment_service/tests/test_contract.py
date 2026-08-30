@@ -4,7 +4,11 @@ from unittest.mock import MagicMock, patch
 
 import jsonschema
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
+
 from consumer import PaymentConsumer
+from db import Base, OutboxEvent, make_session_factory
 from dlq_producer import DLQProducer
 from producer import PaymentProducer
 
@@ -21,20 +25,26 @@ DLQ_ENVELOPE_SCHEMA = load_schema("dlq_envelope.schema.json")
 
 
 def make_consumer():
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    session_factory = make_session_factory(engine)
+
     with patch("consumer.KafkaConsumer"):
-        producer = MagicMock()
         dlq_producer = MagicMock()
-        return PaymentConsumer("localhost:9092", producer=producer, dlq_producer=dlq_producer), producer
+        return PaymentConsumer(
+            "localhost:9092", dlq_producer=dlq_producer, session_factory=session_factory
+        ), session_factory
 
 
 def test_consumer_accepts_reserved_inventory_contract_message_and_publishes_valid_payment():
     event = {"order_id": "1", "product": "laptop", "quantity": 2, "inventory_status": "reserved"}
     jsonschema.validate(instance=event, schema=INVENTORY_RESERVED_SCHEMA)
 
-    c, producer = make_consumer()
+    c, session_factory = make_consumer()
     c._process(event)
 
-    published = producer.send.call_args[0][0]
+    with session_factory() as session:
+        published = session.query(OutboxEvent).one().payload
     jsonschema.validate(instance=published, schema=PAYMENTS_PROCESSED_SCHEMA)
 
 
@@ -42,10 +52,11 @@ def test_consumer_skips_insufficient_inventory_contract_message_without_publishi
     event = {"order_id": "2", "product": "phone", "quantity": 10, "inventory_status": "insufficient"}
     jsonschema.validate(instance=event, schema=INVENTORY_RESERVED_SCHEMA)
 
-    c, producer = make_consumer()
+    c, session_factory = make_consumer()
     c._process(event)
 
-    producer.send.assert_not_called()
+    with session_factory() as session:
+        assert session.query(OutboxEvent).count() == 0
 
 
 def test_producer_output_conforms_to_payments_processed_contract():

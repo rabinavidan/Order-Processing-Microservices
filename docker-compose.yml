@@ -21,36 +21,71 @@ services:
       retries: 10
       start_period: 30s
 
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: orderproc
+      POSTGRES_PASSWORD: orderproc
+      # POSTGRES_DB is only the default bootstrap database; the 4 real
+      # per-service databases are created by the init script below.
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init-databases.sql:/docker-entrypoint-initdb.d/init-databases.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orderproc"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
   order_service:
     build: ./services/order_service
     ports:
       - "8000:8000"
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      DATABASE_URL: postgresql+psycopg2://orderproc:orderproc@postgres:5432/order_db
     depends_on:
       kafka:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
 
   notification_service:
     build: ./services/notification_service
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      DATABASE_URL: postgresql+psycopg2://orderproc:orderproc@postgres:5432/notification_db
     depends_on:
       kafka:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
 
   inventory_service:
     build: ./services/inventory_service
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      DATABASE_URL: postgresql+psycopg2://orderproc:orderproc@postgres:5432/inventory_db
     depends_on:
       kafka:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
 
   payment_service:
     build: ./services/payment_service
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      DATABASE_URL: postgresql+psycopg2://orderproc:orderproc@postgres:5432/payment_db
     depends_on:
       kafka:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

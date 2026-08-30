@@ -4,32 +4,31 @@ import time
 
 from kafka import KafkaConsumer
 
+from db import OutboxEvent, ProcessedMessage, Stock
+
 logger = logging.getLogger(__name__)
 
 IN_TOPIC = "orders"
+OUT_TOPIC = "inventory.reserved"
 GROUP_ID = "inventory-group"
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_BACKOFF_SECONDS = 0.5
-
-_DEFAULT_STOCK = {"laptop": 10, "phone": 5, "keyboard": 20}
 
 
 class InventoryConsumer:
     def __init__(
         self,
         bootstrap_servers: str,
-        producer,
         dlq_producer,
+        session_factory,
         topic: str = IN_TOPIC,
         max_retries: int = DEFAULT_MAX_RETRIES,
         retry_backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS,
     ):
-        self._stock = dict(_DEFAULT_STOCK)
-        self._producer = producer
         self._dlq_producer = dlq_producer
+        self._session_factory = session_factory
         self._max_retries = max_retries
         self._retry_backoff_seconds = retry_backoff_seconds
-        self._seen_order_ids: set = set()
         self._running = True
         self._consumer = KafkaConsumer(
             topic,
@@ -40,7 +39,8 @@ class InventoryConsumer:
             # fully handled (processed or routed to the DLQ) — see consume().
             # This gives correct at-least-once delivery: a crash between
             # receiving and committing redelivers the message on restart,
-            # which idempotent processing (dedup by order_id) makes safe.
+            # which idempotent processing (dedup by order_id, persisted in
+            # ProcessedMessage) makes safe even across a service restart.
             enable_auto_commit=False,
         )
 
@@ -63,6 +63,12 @@ class InventoryConsumer:
     def stop(self) -> None:
         self._running = False
 
+    def _is_duplicate(self, order_id) -> bool:
+        if order_id is None:
+            return False
+        with self._session_factory() as session:
+            return session.get(ProcessedMessage, order_id) is not None
+
     def _handle_message(self, raw_value: bytes) -> None:
         try:
             order = json.loads(raw_value.decode("utf-8"))
@@ -72,15 +78,13 @@ class InventoryConsumer:
             return
 
         order_id = order.get("order_id")
-        if order_id is not None and order_id in self._seen_order_ids:
+        if self._is_duplicate(order_id):
             logger.info("Duplicate order_id=%s already processed, skipping (idempotent)", order_id)
             return
 
         for attempt in range(1, self._max_retries + 1):
             try:
                 self._process(order)
-                if order_id is not None:
-                    self._seen_order_ids.add(order_id)
                 return
             except Exception as exc:
                 logger.warning(
@@ -94,21 +98,32 @@ class InventoryConsumer:
                     self._dlq_producer.send(raw_value, error=str(exc))
 
     def _process(self, order: dict) -> None:
+        """Reserve stock and record the outcome — atomically, in one DB
+        transaction: the stock update, the outbox event that will publish
+        to `inventory.reserved`, and the idempotency ledger entry all commit
+        together or not at all (the Outbox pattern)."""
         product = order.get("product")
         qty = order.get("quantity", 0)
-        available = self._stock.get(product, 0)
+        order_id = order.get("order_id")
 
-        if available >= qty:
-            self._stock[product] = available - qty
-            status = "reserved"
-            logger.info("Inventory reserved: product=%s qty=%s remaining=%s", product, qty, self._stock[product])
-        else:
-            status = "insufficient"
-            logger.warning("Inventory insufficient: product=%s requested=%s available=%s", product, qty, available)
+        with self._session_factory() as session:
+            stock_row = session.get(Stock, product)
+            available = stock_row.quantity if stock_row is not None else 0
 
-        self._producer.send({**order, "inventory_status": status})
+            if available >= qty:
+                stock_row.quantity = available - qty
+                status = "reserved"
+                logger.info("Inventory reserved: product=%s qty=%s remaining=%s", product, qty, stock_row.quantity)
+            else:
+                status = "insufficient"
+                logger.warning("Inventory insufficient: product=%s requested=%s available=%s", product, qty, available)
+
+            event = {**order, "inventory_status": status}
+            session.add(OutboxEvent(topic=OUT_TOPIC, payload=event))
+            if order_id is not None:
+                session.add(ProcessedMessage(order_id=order_id))
+            session.commit()
 
     def close(self) -> None:
         self._consumer.close()
-        self._producer.close()
         self._dlq_producer.close()

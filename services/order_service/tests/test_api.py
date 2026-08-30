@@ -1,11 +1,16 @@
 from unittest.mock import MagicMock, patch
+
 import pytest
 from fastapi.testclient import TestClient
+
 import main
+from db import OrderRecord, OutboxEvent
 
 
 @pytest.fixture
-def client():
+def client(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_order.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
     with patch("main.OrderProducer") as mock_cls:
         mock_cls.return_value = MagicMock()
         with TestClient(main.app) as c:
@@ -42,10 +47,20 @@ def test_create_order_missing_product_returns_422(client):
     assert response.status_code == 422
 
 
-def test_create_order_publishes_to_kafka(client):
+def test_create_order_persists_order_and_outbox_event(client):
     payload = {"order_id": "126", "product": "phone", "quantity": 3}
     client.post("/orders", json=payload)
-    main.producer.send_order.assert_called_once_with(payload)
+
+    with main.session_factory() as session:
+        order = session.get(OrderRecord, "126")
+        assert order is not None
+        assert order.product == "phone"
+        assert order.quantity == 3
+
+        event = session.query(OutboxEvent).filter_by(topic="orders").one()
+        assert event.payload == payload
+        # The relay thread publishes asynchronously, so this may already be
+        # published by the time we check — either state is valid here.
 
 
 def test_create_order_response_body(client):
@@ -57,3 +72,20 @@ def test_create_order_response_body(client):
 def test_orders_get_not_allowed_returns_405(client):
     response = client.get("/orders")
     assert response.status_code == 405
+
+
+def test_create_order_is_idempotent_on_repeated_order_id(client):
+    payload = {"order_id": "128", "product": "laptop", "quantity": 1}
+
+    response1 = client.post("/orders", json=payload)
+    response2 = client.post("/orders", json=payload)
+
+    assert response1.status_code == 201
+    assert response2.status_code == 201
+    assert response1.json() == response2.json()
+
+    with main.session_factory() as session:
+        assert session.query(OrderRecord).filter_by(order_id="128").count() == 1
+        # This test's DB is isolated per-test (fresh tmp_path file), so the
+        # total outbox row count is exactly the count for this one order_id.
+        assert session.query(OutboxEvent).count() == 1
