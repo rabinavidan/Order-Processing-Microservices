@@ -39,11 +39,13 @@ A mini microservices project demonstrating **FastAPI**, **Apache Kafka**, **Dock
 
 ### Kafka Topics
 
-| Topic                  | Producer          | Consumer(s)                          |
-|------------------------|-------------------|--------------------------------------|
-| `orders`               | Order Service     | Notification Service, Inventory Service |
-| `inventory.reserved`   | Inventory Service | Payment Service                      |
-| `payments.processed`   | Payment Service   | —                                    |
+| Topic                     | Producer               | Consumer(s)                             |
+|----------------------------|-------------------------|-------------------------------------------|
+| `orders`                  | Order Service          | Notification Service, Inventory Service |
+| `inventory.reserved`      | Inventory Service      | Payment Service                         |
+| `payments.processed`      | Payment Service        | —                                        |
+| `orders.dlq`               | Inventory Service, Notification Service | — (quarantine, see [Resilience](#resilience)) |
+| `inventory.reserved.dlq`   | Payment Service         | — (quarantine, see [Resilience](#resilience)) |
 
 ### In-memory stock (Inventory Service)
 
@@ -64,7 +66,8 @@ A mini microservices project demonstrating **FastAPI**, **Apache Kafka**, **Dock
 ├── contracts/                      # Kafka topic JSON Schemas (producer/consumer contract)
 │   ├── orders.schema.json
 │   ├── inventory_reserved.schema.json
-│   └── payments_processed.schema.json
+│   ├── payments_processed.schema.json
+│   └── dlq_envelope.schema.json
 ├── e2e/                             # Cross-service end-to-end test (real Kafka via testcontainers)
 │   ├── conftest.py
 │   ├── test_order_pipeline.py
@@ -81,33 +84,36 @@ A mini microservices project demonstrating **FastAPI**, **Apache Kafka**, **Dock
 │   │       ├── test_producer.py    # Producer unit tests
 │   │       └── test_contract.py    # `orders` topic contract tests
 │   ├── notification_service/
-│   │   ├── main.py                 # Consumer entry point
-│   │   ├── consumer.py             # KafkaConsumer wrapper
+│   │   ├── main.py                 # Entry point + signal handling for graceful shutdown
+│   │   ├── consumer.py             # Idempotent, retrying KafkaConsumer wrapper
+│   │   ├── dlq_producer.py         # Publishes poison messages to orders.dlq
 │   │   ├── requirements.txt
 │   │   ├── Dockerfile
 │   │   └── tests/
-│   │       ├── test_consumer.py    # Consumer unit tests
-│   │       └── test_contract.py    # `orders` topic contract tests
+│   │       ├── test_consumer.py    # Consumer + idempotency/retry/DLQ/shutdown tests
+│   │       └── test_contract.py    # `orders` + DLQ envelope contract tests
 │   ├── inventory_service/
-│   │   ├── main.py                 # Consumer entry point
-│   │   ├── consumer.py             # Consumes orders, reserves stock
+│   │   ├── main.py                 # Entry point + signal handling for graceful shutdown
+│   │   ├── consumer.py             # Consumes orders, reserves stock (idempotent, retrying)
 │   │   ├── producer.py             # Publishes to inventory.reserved
+│   │   ├── dlq_producer.py         # Publishes poison messages to orders.dlq
 │   │   ├── requirements.txt
 │   │   ├── Dockerfile
 │   │   └── tests/
-│   │       ├── test_consumer.py    # Stock reservation logic tests
+│   │       ├── test_consumer.py    # Reservation logic + idempotency/retry/DLQ/shutdown tests
 │   │       ├── test_producer.py    # Producer unit tests
-│   │       └── test_contract.py    # `orders` / `inventory.reserved` contract tests
+│   │       └── test_contract.py    # `orders` / `inventory.reserved` / DLQ contract tests
 │   └── payment_service/
-│       ├── main.py                 # Consumer entry point
-│       ├── consumer.py             # Consumes inventory.reserved, processes payment
+│       ├── main.py                 # Entry point + signal handling for graceful shutdown
+│       ├── consumer.py             # Consumes inventory.reserved, processes payment (idempotent, retrying)
 │       ├── producer.py             # Publishes to payments.processed
+│       ├── dlq_producer.py         # Publishes poison messages to inventory.reserved.dlq
 │       ├── requirements.txt
 │       ├── Dockerfile
 │       └── tests/
-│           ├── test_consumer.py    # Payment processing logic tests
+│           ├── test_consumer.py    # Payment logic + idempotency/retry/DLQ/shutdown tests
 │           ├── test_producer.py    # Producer unit tests
-│           └── test_contract.py    # `inventory.reserved` / `payments.processed` contract tests
+│           └── test_contract.py    # `inventory.reserved` / `payments.processed` / DLQ contract tests
 ```
 
 ---
@@ -161,6 +167,43 @@ curl http://localhost:8000/health
 ```bash
 docker-compose down
 ```
+
+---
+
+## Resilience
+
+The 3 consumer services (`notification_service`, `inventory_service`, `payment_service`) share the same failure-handling design, so a redelivered or malformed message never double-processes an order or crashes a consumer.
+
+### At-least-once delivery, made safe
+
+Each consumer sets `enable_auto_commit=False` and commits its offset **only after** a message has been fully handled — processed successfully, or routed to the DLQ. If the process crashes between receiving a message and committing, that message is redelivered on restart (standard Kafka at-least-once semantics). Naively this could double-reserve stock or double-charge a payment; the idempotency layer below is what makes redelivery safe instead of dangerous.
+
+Each consumer group is also explicitly named and stable across restarts:
+
+| Service               | `group_id`             | Topic consumed        |
+|------------------------|--------------------------|--------------------------|
+| Notification Service  | `notification-group`    | `orders`                |
+| Inventory Service     | `inventory-group`       | `orders`                |
+| Payment Service       | `payment-group`         | `inventory.reserved`    |
+
+### Idempotent processing
+
+Every consumer keeps an in-memory set of `order_id`s it has already processed successfully. A redelivered message for an `order_id` already in that set is logged and skipped before it reaches business logic (`_process`) — so a duplicate `orders` message never decrements inventory stock twice, and a duplicate `inventory.reserved` message never charges payment twice.
+
+> This dedup set is process-local (an in-memory `set`, not a durable store), so it resets on restart — a redelivery that happens to land after a restart is not caught. Moving it to durable storage (e.g. a persisted set of processed IDs, or an idempotency table) is exactly what milestone M3 (Persistence & State) adds.
+
+### Retry with backoff, then dead-letter
+
+Each consumer wraps `_process()` in a retry loop (3 attempts by default, exponential backoff starting at 0.5s) before giving up. A message that still fails after all retries — or one that can't even be JSON-decoded — is published as-is to a dead-letter topic instead of crashing the consumer or blocking the partition forever:
+
+- `orders.dlq` — poison messages from `notification_service` and `inventory_service`
+- `inventory.reserved.dlq` — poison messages from `payment_service`
+
+Each DLQ topic is shared across the consumer groups that read its source topic; the envelope (see [`contracts/dlq_envelope.schema.json`](contracts/dlq_envelope.schema.json)) carries `consumer_group`, `error`, `original_value`, and `failed_at` so a failed message can be triaged and, once fixed, replayed.
+
+### Graceful shutdown
+
+Each service's `main.py` registers `SIGTERM`/`SIGINT` handlers that call the consumer's `stop()` method. The poll loop (`poll(timeout_ms=1000)` rather than the blocking `for message in consumer:` idiom) checks a running flag between messages, so a shutdown signal is picked up within ~1s instead of only between broker round-trips, and never interrupts a message mid-processing — avoiding both lost messages and unnecessary duplicate processing on the next restart.
 
 ---
 
@@ -232,14 +275,14 @@ pytest -v
 | `order_service/test_api.py`                 | POST /orders → 201, invalid payload → 422, wrong type → 422, missing field → 422, GET /health → 200, GET /orders → 405, response body, producer called with payload |
 | `order_service/test_producer.py`            | `send_order()` calls Kafka send + flush, `close()` calls Kafka close |
 | `order_service/test_contract.py`            | producer output validates against `orders` schema; schema rejects missing/wrong-typed fields |
-| `notification_service/test_consumer.py`     | logs order fields, handles missing fields, multiple messages, consumer topic/group config, `close()` |
-| `notification_service/test_contract.py`     | consumer accepts any `orders`-schema-valid message                    |
-| `inventory_service/test_consumer.py`        | reserved/insufficient/boundary/unknown product/field preservation    |
+| `notification_service/test_consumer.py`     | logs order fields, handles missing fields, multiple messages, consumer topic/group config, `close()`, duplicate order_id skipped, malformed JSON → DLQ, retry-then-succeed, retries exhausted → DLQ, graceful stop |
+| `notification_service/test_contract.py`     | consumer accepts any `orders`-schema-valid message; DLQ output validates against DLQ envelope schema |
+| `inventory_service/test_consumer.py`        | reserved/insufficient/boundary/unknown product/field preservation, duplicate order_id skipped, malformed JSON → DLQ, retry-then-succeed, retries exhausted → DLQ, graceful stop |
 | `inventory_service/test_producer.py`        | `send()` calls Kafka send + flush, `close()` calls Kafka close       |
-| `inventory_service/test_contract.py`        | consumer accepts `orders`-schema messages; producer output validates against `inventory.reserved` schema |
-| `payment_service/test_consumer.py`          | paid when reserved, skips when insufficient/missing, field preservation |
+| `inventory_service/test_contract.py`        | consumer accepts `orders`-schema messages; producer output validates against `inventory.reserved` schema; DLQ output validates against DLQ envelope schema |
+| `payment_service/test_consumer.py`          | paid when reserved, skips when insufficient/missing, field preservation, duplicate order_id skipped, malformed JSON → DLQ, retry-then-succeed, retries exhausted → DLQ, graceful stop |
 | `payment_service/test_producer.py`          | `send()` calls Kafka send + flush, `close()` calls Kafka close       |
-| `payment_service/test_contract.py`          | consumer accepts `inventory.reserved`-schema messages; producer output validates against `payments.processed` schema |
+| `payment_service/test_contract.py`          | consumer accepts `inventory.reserved`-schema messages; producer output validates against `payments.processed` schema; DLQ output validates against DLQ envelope schema |
 | `e2e/test_order_pipeline.py`                | full order saga over a real Kafka broker, across all 4 services' actual code |
 
 ---

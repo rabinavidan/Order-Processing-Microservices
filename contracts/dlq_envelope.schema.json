@@ -1,0 +1,16 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://order-processing-microservices/contracts/dlq_envelope.schema.json",
+  "title": "dead-letter envelope",
+  "description": "Envelope published to `<source_topic>.dlq` by any consumer that could not process a message after exhausting its retries, or that received a message it could not even deserialize.",
+  "type": "object",
+  "required": ["source_topic", "consumer_group", "error", "original_value", "failed_at"],
+  "properties": {
+    "source_topic": { "type": "string" },
+    "consumer_group": { "type": "string" },
+    "error": { "type": "string" },
+    "original_value": {},
+    "failed_at": { "type": "string", "format": "date-time" }
+  },
+  "additionalProperties": false
+}

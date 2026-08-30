@@ -7,6 +7,7 @@ JSON Schema definitions for every message shape that crosses a Kafka topic in th
 | `orders.schema.json`                  | `orders`               | `order_service`      | `notification_service`, `inventory_service` |
 | `inventory_reserved.schema.json`      | `inventory.reserved`   | `inventory_service`  | `payment_service`                         |
 | `payments_processed.schema.json`      | `payments.processed`   | `payment_service`    | —                                          |
+| `dlq_envelope.schema.json`            | `orders.dlq`, `inventory.reserved.dlq` | `inventory_service`, `payment_service`, `notification_service` | — (quarantine, see [Resilience](../README.md#resilience)) |
 
 Each service's `tests/test_contract.py`:
 

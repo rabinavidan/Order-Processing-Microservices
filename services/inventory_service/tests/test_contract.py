@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import jsonschema
 import pytest
 from consumer import InventoryConsumer
+from dlq_producer import DLQProducer
 from producer import InventoryProducer
 
 CONTRACTS_DIR = Path(__file__).resolve().parents[3] / "contracts"
@@ -16,12 +17,14 @@ def load_schema(name: str) -> dict:
 
 ORDERS_SCHEMA = load_schema("orders.schema.json")
 INVENTORY_RESERVED_SCHEMA = load_schema("inventory_reserved.schema.json")
+DLQ_ENVELOPE_SCHEMA = load_schema("dlq_envelope.schema.json")
 
 
 def make_consumer():
     with patch("consumer.KafkaConsumer"):
         producer = MagicMock()
-        return InventoryConsumer("localhost:9092", producer=producer), producer
+        dlq_producer = MagicMock()
+        return InventoryConsumer("localhost:9092", producer=producer, dlq_producer=dlq_producer), producer
 
 
 @pytest.mark.parametrize(
@@ -60,3 +63,16 @@ def test_inventory_reserved_contract_rejects_unknown_status():
             instance={"order_id": "1", "product": "laptop", "quantity": 2, "inventory_status": "maybe"},
             schema=INVENTORY_RESERVED_SCHEMA,
         )
+
+
+def test_dlq_producer_output_conforms_to_dlq_envelope_contract():
+    with patch("dlq_producer.KafkaProducer") as mock_cls:
+        mock_kafka = MagicMock()
+        mock_cls.return_value = mock_kafka
+        p = DLQProducer("localhost:9092", source_topic="orders", consumer_group="inventory-group")
+        p.send(b'{"order_id": "1", "product": "laptop", "quantity": "two"}', error="boom")
+
+        published = mock_kafka.send.call_args[0][1]
+        jsonschema.validate(instance=published, schema=DLQ_ENVELOPE_SCHEMA)
+        assert published["source_topic"] == "orders"
+        assert published["consumer_group"] == "inventory-group"
