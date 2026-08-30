@@ -1,5 +1,8 @@
 # Order Processing — Microservices
 
+[![CI](https://github.com/rabinavidan/Order-Processing-Microservices/actions/workflows/ci.yml/badge.svg)](https://github.com/rabinavidan/Order-Processing-Microservices/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/rabinavidan/Order-Processing-Microservices/branch/master/graph/badge.svg)](https://codecov.io/gh/rabinavidan/Order-Processing-Microservices)
+
 A mini microservices project demonstrating **FastAPI**, **Apache Kafka**, **Docker**, and **pytest** using an order processing domain.
 
 ---
@@ -149,9 +152,17 @@ docker-compose down
 
 ---
 
+## Continuous Integration
+
+Every push and pull request runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml), which:
+
+- Runs `pytest` for each of the 4 services in a matrix job (Python 3.11)
+- Collects coverage with `pytest-cov` and uploads an HTML/XML coverage report as a CI artifact per service
+- Publishes coverage to Codecov (aggregated across all 4 services)
+
 ## Running Tests Locally
 
-Tests use mocked Kafka — no Docker required.
+Tests use mocked Kafka — no Docker required. Add `--cov=. --cov-report=term-missing` to any `pytest` command below to see coverage locally.
 
 **Order Service**
 ```bash
