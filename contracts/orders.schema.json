@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://order-processing-microservices/contracts/orders.schema.json",
+  "title": "orders",
+  "description": "Message published by order_service to the 'orders' topic, consumed by notification_service and inventory_service.",
+  "type": "object",
+  "required": ["order_id", "product", "quantity"],
+  "properties": {
+    "order_id": { "type": "string" },
+    "product": { "type": "string" },
+    "quantity": { "type": "integer" }
+  },
+  "additionalProperties": false
+}

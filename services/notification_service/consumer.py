@@ -17,13 +17,15 @@ class OrderConsumer:
 
     def consume(self) -> None:
         for message in self._consumer:
-            order = message.value
-            logger.info(
-                "Notification: Order received — id=%s product=%s qty=%s",
-                order.get("order_id"),
-                order.get("product"),
-                order.get("quantity"),
-            )
+            self._process(message.value)
+
+    def _process(self, order: dict) -> None:
+        logger.info(
+            "Notification: Order received — id=%s product=%s qty=%s",
+            order.get("order_id"),
+            order.get("product"),
+            order.get("quantity"),
+        )
 
     def close(self) -> None:
         self._consumer.close()
