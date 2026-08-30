@@ -30,7 +30,7 @@ def test_consumer_accepts_any_orders_contract_valid_message(order, caplog):
     jsonschema.validate(instance=order, schema=ORDERS_SCHEMA)
 
     with patch("consumer.KafkaConsumer"):
-        c = OrderConsumer("localhost:9092", dlq_producer=MagicMock())
+        c = OrderConsumer("localhost:9092", dlq_producer=MagicMock(), session_factory=MagicMock())
         with caplog.at_level(logging.INFO):
             c._process(order)
 

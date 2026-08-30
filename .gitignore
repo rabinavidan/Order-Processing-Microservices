@@ -27,6 +27,10 @@ coverage.xml
 .env
 .env.*
 
+# Local SQLite databases (the default DATABASE_URL fallback for local runs)
+*.db
+*.db-journal
+
 # Docker
 *.log
 

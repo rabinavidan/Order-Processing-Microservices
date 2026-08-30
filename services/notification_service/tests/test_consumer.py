@@ -3,10 +3,27 @@ import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
+
 from consumer import OrderConsumer
+from db import Base, make_session_factory
 
 
-def make_consumer(max_retries=3, retry_backoff_seconds=0.0):
+def make_session_factory_in_memory():
+    # StaticPool keeps one shared connection alive for the whole in-memory
+    # DB's lifetime, so multiple OrderConsumer instances (simulating a
+    # restart) can see the same persisted rows within a test.
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    return make_session_factory(engine)
+
+
+def make_consumer(max_retries=3, retry_backoff_seconds=0.0, session_factory=None):
     with patch("consumer.KafkaConsumer") as mock_cls:
         mock_kafka = MagicMock()
         mock_cls.return_value = mock_kafka
@@ -14,6 +31,7 @@ def make_consumer(max_retries=3, retry_backoff_seconds=0.0):
         c = OrderConsumer(
             "localhost:9092",
             dlq_producer=dlq_producer,
+            session_factory=session_factory or make_session_factory_in_memory(),
             max_retries=max_retries,
             retry_backoff_seconds=retry_backoff_seconds,
         )
@@ -87,7 +105,7 @@ def test_consume_processes_every_message_on_the_topic(caplog):
 
 def test_consumer_configured_with_correct_topic_and_group():
     with patch("consumer.KafkaConsumer") as mock_cls:
-        OrderConsumer("localhost:9092", dlq_producer=MagicMock())
+        OrderConsumer("localhost:9092", dlq_producer=MagicMock(), session_factory=make_session_factory_in_memory())
         args, kwargs = mock_cls.call_args
         assert args[0] == "orders"
         assert kwargs["group_id"] == "notification-group"
@@ -128,6 +146,21 @@ def test_different_order_ids_are_both_processed(caplog):
     assert "2" in caplog.text
 
 
+def test_idempotency_survives_a_restart(caplog):
+    """The dedup ledger is a DB table, not an in-memory set, so a brand new
+    OrderConsumer instance pointed at the same database still recognizes a
+    previously processed order_id — proving dedup survives a process restart."""
+    session_factory = make_session_factory_in_memory()
+    c1, _, _ = make_consumer(session_factory=session_factory)
+    c1._handle_message(encode({"order_id": "restart-1", "product": "laptop", "quantity": 1}))
+
+    c2, _, _ = make_consumer(session_factory=session_factory)  # simulates a fresh process
+    with caplog.at_level(logging.INFO):
+        c2._handle_message(encode({"order_id": "restart-1", "product": "laptop", "quantity": 1}))
+
+    assert "Duplicate order_id=restart-1" in caplog.text
+
+
 # --- Retry + DLQ -------------------------------------------------------------
 
 
@@ -151,7 +184,7 @@ def test_processing_failure_retries_then_succeeds():
 
     assert mock_process.call_count == 2
     dlq_producer.send.assert_not_called()
-    assert "retry-1" in c._seen_order_ids
+    assert c._is_duplicate("retry-1")
 
 
 def test_processing_failure_exhausts_retries_then_routes_to_dlq():
@@ -163,7 +196,7 @@ def test_processing_failure_exhausts_retries_then_routes_to_dlq():
 
     assert mock_process.call_count == 3
     dlq_producer.send.assert_called_once()
-    assert "poison-1" not in c._seen_order_ids
+    assert not c._is_duplicate("poison-1")
 
 
 # --- Graceful shutdown -------------------------------------------------------
