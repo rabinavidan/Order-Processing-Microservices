@@ -16,6 +16,12 @@ polls the real broker for the next message, then feeds it to the same
 `_process` method the unit tests exercise with mocks. This is standard
 practice for testing Kafka consumers without relying on a background loop
 that would need machinery to stop mid-test.
+
+The resilience features added in M2 (idempotent dedup, retry+backoff, DLQ
+routing, manual offset commit) live in each consumer's `_handle_message`
+wrapper and are covered by dedicated unit tests per service — this test
+stays focused on proving the wiring between all 4 services is correct end
+to end over a real broker.
 """
 
 import json
@@ -31,13 +37,13 @@ POLL_TIMEOUT_S = 30
 
 
 def poll_one(kafka_consumer: KafkaConsumer, timeout_s: float = POLL_TIMEOUT_S) -> dict:
-    """Block until exactly one message is available on a real KafkaConsumer, or time out."""
+    """Block until exactly one raw message is available on a real KafkaConsumer, decode it as JSON, or time out."""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         records = kafka_consumer.poll(timeout_ms=1000, max_records=1)
         for _, messages in records.items():
             if messages:
-                return messages[0].value
+                return json.loads(messages[0].value.decode("utf-8"))
     raise TimeoutError(f"No message received within {timeout_s}s")
 
 
@@ -51,22 +57,34 @@ def test_full_order_pipeline_via_real_kafka(kafka_bootstrap_server):
     order_producer_mod = load_module("e2e_order_producer", "order_service", "producer.py")
     inventory_consumer_mod = load_module("e2e_inventory_consumer", "inventory_service", "consumer.py")
     inventory_producer_mod = load_module("e2e_inventory_producer", "inventory_service", "producer.py")
+    inventory_dlq_mod = load_module("e2e_inventory_dlq", "inventory_service", "dlq_producer.py")
     payment_consumer_mod = load_module("e2e_payment_consumer", "payment_service", "consumer.py")
     payment_producer_mod = load_module("e2e_payment_producer", "payment_service", "producer.py")
+    payment_dlq_mod = load_module("e2e_payment_dlq", "payment_service", "dlq_producer.py")
     notification_consumer_mod = load_module("e2e_notification_consumer", "notification_service", "consumer.py")
+    notification_dlq_mod = load_module("e2e_notification_dlq", "notification_service", "dlq_producer.py")
 
     order_producer = order_producer_mod.OrderProducer(kafka_bootstrap_server)
+
     inventory_producer = inventory_producer_mod.InventoryProducer(kafka_bootstrap_server)
-    inventory_consumer = inventory_consumer_mod.InventoryConsumer(kafka_bootstrap_server, producer=inventory_producer)
+    inventory_dlq = inventory_dlq_mod.DLQProducer(kafka_bootstrap_server, source_topic="orders", consumer_group="inventory-group")
+    inventory_consumer = inventory_consumer_mod.InventoryConsumer(
+        kafka_bootstrap_server, producer=inventory_producer, dlq_producer=inventory_dlq
+    )
+
     payment_producer = payment_producer_mod.PaymentProducer(kafka_bootstrap_server)
-    payment_consumer = payment_consumer_mod.PaymentConsumer(kafka_bootstrap_server, producer=payment_producer)
-    notification_consumer = notification_consumer_mod.OrderConsumer(kafka_bootstrap_server)
+    payment_dlq = payment_dlq_mod.DLQProducer(kafka_bootstrap_server, source_topic="inventory.reserved", consumer_group="payment-group")
+    payment_consumer = payment_consumer_mod.PaymentConsumer(
+        kafka_bootstrap_server, producer=payment_producer, dlq_producer=payment_dlq
+    )
+
+    notification_dlq = notification_dlq_mod.DLQProducer(kafka_bootstrap_server, source_topic="orders", consumer_group="notification-group")
+    notification_consumer = notification_consumer_mod.OrderConsumer(kafka_bootstrap_server, dlq_producer=notification_dlq)
 
     final_consumer = KafkaConsumer(
         "payments.processed",
         bootstrap_servers=kafka_bootstrap_server,
         auto_offset_reset="earliest",
-        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
         group_id="e2e-assertions",
     )
 
